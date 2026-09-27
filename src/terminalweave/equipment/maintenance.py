@@ -25,7 +25,8 @@ class EquipmentMeter:
     def update(self, hours: float, at: datetime) -> float:
         at = ensure_utc(at)
         if at <= self.last_updated:
-            raise ValidationError('meter update must be newer')
+            # Late or duplicate reading: absorb it, never roll state back.
+            return 0.0
         if hours < self.hours:
             raise ValidationError('usage meter cannot move backwards')
         delta = hours - self.hours
@@ -68,7 +69,13 @@ class MaintenanceManager:
         self._plans[plan.plan_id] = plan
 
     def register_meter(self, meter: EquipmentMeter) -> None:
-        self._meters[meter.equipment_id] = meter
+        existing = self._meters.get(meter.equipment_id)
+        if existing is None:
+            self._meters[meter.equipment_id] = meter
+            return
+        # Re-registration folds into the canonical meter monotonically, so a
+        # stale or replayed registration can never roll the reading back.
+        existing.update(meter.hours, meter.last_updated)
 
     def due_hours(self, equipment_id: str, plan_id: str) -> float:
         plan = self._plans[plan_id]
@@ -82,6 +89,13 @@ class MaintenanceManager:
         plan = self._plans[plan_id]
         return self._meters[equipment_id].hours > self.due_hours(equipment_id, plan_id) + plan.grace_hours
 
+    def needs_service(self, equipment_id: str) -> bool:
+        if equipment_id not in self._meters:
+            return False
+        if any((o.equipment_id == equipment_id and o.state in {WorkOrderState.OPEN, WorkOrderState.IN_PROGRESS} for o in self._orders.values())):
+            return True
+        return any((self.is_due(equipment_id, plan_id) for plan_id in self._plans))
+
     def open_due_orders(self, now: datetime) -> list[WorkOrder]:
         now = ensure_utc(now)
         created = []
@@ -89,14 +103,25 @@ class MaintenanceManager:
             for plan_id in sorted(self._plans):
                 if not self.is_due(equipment_id, plan_id):
                     continue
-                existing = [o for o in self._orders.values() if o.equipment_id == equipment_id and o.plan_id == plan_id and (o.state in {WorkOrderState.OPEN, WorkOrderState.IN_PROGRESS})]
+                due = self.due_hours(equipment_id, plan_id)
+                # An order already raised for this exact service threshold is
+                # never regenerated, whatever state it is in.
+                existing = [o for o in self._orders.values() if o.equipment_id == equipment_id and o.plan_id == plan_id and (o.state in {WorkOrderState.OPEN, WorkOrderState.IN_PROGRESS} or o.due_at_meter == due)]
                 if existing:
                     continue
-                due = self.due_hours(equipment_id, plan_id)
-                order = WorkOrder(f'WO-{equipment_id}-{plan_id}-{int(due)}', equipment_id, plan_id, due, now)
+                order = WorkOrder(self._next_order_id(equipment_id, plan_id, due), equipment_id, plan_id, due, now)
                 self._orders[order.order_id] = order
                 created.append(order)
         return created
+
+    def _next_order_id(self, equipment_id: str, plan_id: str, due: float) -> str:
+        base = f'WO-{equipment_id}-{plan_id}-{int(due)}'
+        order_id = base
+        suffix = 2
+        while order_id in self._orders:
+            order_id = f'{base}-{suffix}'
+            suffix += 1
+        return order_id
 
     def start(self, order_id: str, at: datetime) -> WorkOrder:
         order = self._orders[order_id]
@@ -118,5 +143,8 @@ class MaintenanceManager:
         order.state = WorkOrderState.DONE
         order.completed_at = at
         order.completed_meter = meter.hours
-        self._last_service[order.equipment_id, order.plan_id] = meter.hours
+        # The service record only moves forward, so a completed threshold can
+        # never become due again after later meter corrections.
+        key = (order.equipment_id, order.plan_id)
+        self._last_service[key] = max(self._last_service.get(key, 0.0), meter.hours)
         return order

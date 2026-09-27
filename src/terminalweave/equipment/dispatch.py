@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from math import hypot
-from terminalweave.core.errors import ValidationError, CapacityError
+from terminalweave.core.errors import ValidationError, CapacityError, ConflictError
 
 @dataclass(frozen=True)
 class Position:
@@ -39,13 +39,19 @@ class EquipmentDispatcher:
     def __init__(self, units: list[DispatchUnit]):
         self.units = {u.equipment_id: u for u in units}
         self.busy: set[str] = set()
+        self._assignments: dict[str, str] = {}
+
+    def assignment(self, job_id: str) -> str | None:
+        return self._assignments.get(job_id)
 
     def dispatch(self, job: DispatchJob) -> DispatchDecision:
         if job.load_tonnes <= 0:
             raise ValidationError('load must be positive')
+        if job.job_id in self._assignments:
+            raise ConflictError('job is already dispatched')
         candidates = []
         for unit in self.units.values():
-            if not unit.available or unit.equipment_id in self.busy or unit.kind != job.required_kind or (unit.capacity_tonnes < job.load_tonnes):
+            if not unit.available or unit.maintenance_due or unit.equipment_id in self.busy or unit.kind != job.required_kind or (unit.capacity_tonnes < job.load_tonnes):
                 continue
             dead = hypot(unit.position.x - job.pickup.x, unit.position.y - job.pickup.y)
             loaded = hypot(job.dropoff.x - job.pickup.x, job.dropoff.y - job.pickup.y)
@@ -55,9 +61,22 @@ class EquipmentDispatcher:
             raise CapacityError('no compatible equipment available')
         score, dead, _, unit = min(candidates)
         self.busy.add(unit.equipment_id)
+        self._assignments[job.job_id] = unit.equipment_id
         return DispatchDecision(unit.equipment_id, job.job_id, dead, hypot(job.dropoff.x - job.pickup.x, job.dropoff.y - job.pickup.y), score)
 
     def release(self, equipment_id: str, new_position: Position) -> None:
         unit = self.units[equipment_id]
         self.units[equipment_id] = DispatchUnit(unit.equipment_id, unit.kind, unit.capacity_tonnes, new_position, unit.available, unit.maintenance_due)
         self.busy.discard(equipment_id)
+        for job_id, assigned in list(self._assignments.items()):
+            if assigned == equipment_id:
+                del self._assignments[job_id]
+
+    def sync_unit(self, equipment_id: str, *, available: bool | None=None, maintenance_due: bool | None=None, position: Position | None=None) -> DispatchUnit:
+        # Refreshes availability flags from the authoritative sources without
+        # touching in-flight assignments: a started task keeps its unit, the
+        # new flags only gate future dispatch decisions.
+        unit = self.units[equipment_id]
+        updated = DispatchUnit(unit.equipment_id, unit.kind, unit.capacity_tonnes, position if position is not None else unit.position, unit.available if available is None else available, unit.maintenance_due if maintenance_due is None else maintenance_due)
+        self.units[equipment_id] = updated
+        return updated
