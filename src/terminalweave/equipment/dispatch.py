@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from math import hypot
-from terminalweave.core.errors import ValidationError, CapacityError
+from terminalweave.core.errors import ValidationError, CapacityError, StateTransitionError
 
 @dataclass(frozen=True)
 class Position:
@@ -45,7 +45,7 @@ class EquipmentDispatcher:
             raise ValidationError('load must be positive')
         candidates = []
         for unit in self.units.values():
-            if not unit.available or unit.equipment_id in self.busy or unit.kind != job.required_kind or (unit.capacity_tonnes < job.load_tonnes):
+            if not unit.available or unit.maintenance_due or unit.equipment_id in self.busy or unit.kind != job.required_kind or (unit.capacity_tonnes < job.load_tonnes):
                 continue
             dead = hypot(unit.position.x - job.pickup.x, unit.position.y - job.pickup.y)
             loaded = hypot(job.dropoff.x - job.pickup.x, job.dropoff.y - job.pickup.y)
@@ -57,7 +57,14 @@ class EquipmentDispatcher:
         self.busy.add(unit.equipment_id)
         return DispatchDecision(unit.equipment_id, job.job_id, dead, hypot(job.dropoff.x - job.pickup.x, job.dropoff.y - job.pickup.y), score)
 
+    def sync_unit(self, unit: DispatchUnit) -> None:
+        # Refreshes the status snapshot only; a unit with a job in progress
+        # stays busy, so started work is never silently reassigned.
+        self.units[unit.equipment_id] = unit
+
     def release(self, equipment_id: str, new_position: Position) -> None:
+        if equipment_id not in self.busy:
+            raise StateTransitionError(f'equipment {equipment_id} has no active job')
         unit = self.units[equipment_id]
         self.units[equipment_id] = DispatchUnit(unit.equipment_id, unit.kind, unit.capacity_tonnes, new_position, unit.available, unit.maintenance_due)
         self.busy.discard(equipment_id)
